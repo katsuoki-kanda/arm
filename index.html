@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>アーム・マスター 60 Ver4.1</title>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            background-color: #000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            width: 100vw;
+            overflow: hidden;
+            font-family: 'Arial Black', 'Hiragino Kaku Gothic Pro', 'Meiryo', sans-serif;
+        }
+
+        .container { position: relative; width: 100%; height: 100%; }
+        video { display: none; }
+        canvas {
+            width: 100vw; height: 100vh;
+            object-fit: cover;
+            transform: scaleX(-1);
+        }
+
+        .ui-header {
+            position: absolute;
+            top: 20px; left: 0; width: 100%;
+            padding: 0 50px;
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            z-index: 50;
+            pointer-events: none;
+        }
+
+        .info-box {
+            background: rgba(0,0,0,0.8);
+            padding: 15px 35px;
+            border-radius: 15px;
+            font-size: 38px;
+            border: 4px solid;
+            font-weight: 900;
+            min-width: 240px;
+            text-align: center;
+        }
+        #score-display { color: #00ffcc; border-color: #00ffcc; }
+        #timer-display { color: #ff3366; border-color: #ff3366; }
+
+        #command-container {
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            width: 100%;
+            text-align: center;
+            pointer-events: none;
+            z-index: 20;
+        }
+
+        #command-text {
+            font-size: min(45vh, 48vw);
+            font-weight: 900;
+            color: #00ff00;
+            white-space: nowrap;
+            line-height: 1.0;
+            text-shadow: 10px 10px 0px #000, -10px -10px 0px #000, 0 0 70px rgba(0,0,0,1);
+        }
+
+        .overlay {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            display: flex; flex-direction: column;
+            justify-content: center; align-items: center; z-index: 100; color: white;
+        }
+        #start-screen { background: rgba(0,0,0,0.9); }
+        .overlay.preview-mode { background: rgba(0,0,0,0.2) !important; }
+
+        .btn-start {
+            padding: 30px 70px;
+            font-size: 36px;
+            background: #28a745;
+            color: white;
+            border: none;
+            border-radius: 70px;
+            cursor: pointer;
+            font-weight: bold;
+            box-shadow: 0 0 40px rgba(40,167,69,0.5);
+            margin-bottom: 30px;
+        }
+
+        .guide-box {
+            text-align: center; font-size: 24px; line-height: 1.8;
+            background: rgba(0,0,0,0.85); padding: 30px 50px; border-radius: 25px;
+        }
+        .highlight { color: #00ffcc; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <video id="input_video" playsinline></video>
+        <canvas id="output_canvas"></canvas>
+
+        <div class="ui-header">
+            <div id="score-display" class="info-box">SCORE: <span id="val-score">0</span></div>
+            <div id="timer-display" class="info-box">TIME: <span id="val-timer">60</span></div>
+        </div>
+
+        <div id="command-container">
+            <div id="command-text"></div>
+        </div>
+
+        <div id="start-screen" class="overlay">
+            <h1 style="font-size: 70px; margin-bottom: 20px;">アーム・マスター 60</h1>
+            <button class="btn-start" onclick="initApp()">カメラを起動</button>
+            <div class="guide-box">
+                <span class="highlight">「片手をあげて」→「おろす」</span> でスタート！
+            </div>
+        </div>
+
+        <div id="result-screen" class="overlay" style="display: none;">
+            <h1 style="font-size: 110px; color: #ffcc00; margin-bottom: 10px;">FINISH!</h1>
+            <div style="font-size: 90px; margin-bottom: 30px;">SCORE: <span id="final-score" style="color:#00ffcc;">0</span></div>
+            <div class="guide-box">片手をあげて、おろすとリスタート</div>
+        </div>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('input_video');
+        const canvasElement = document.getElementById('output_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const cmdText = document.getElementById('command-text');
+
+        const commands = [
+            "右上", "右外", "右前", "右内", "右後",
+            "左上", "左外", "左前", "左内", "左後",
+            "両上", "両外", "両前", "両内", "両後"
+        ];
+
+        let currentTarget = "";
+        let score = 0;
+        let timeLeft = 60;
+        let gameActive = false;
+        let isWaitingForReturn = false;
+        let isProcessingSuccess = false;
+        let waitingForStartDown = false;
+        let startLockedAfterAbort = false; 
+        let timerInterval = null;
+        let appInitialized = false;
+
+        let handsUpStartTime = null;
+        const EXIT_HOLD_TIME = 4000;
+
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const synth = window.speechSynthesis;
+
+        function playSound(freq, duration) {
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.frequency.value = freq;
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.start();
+            gain.gain.exponentialRampToValueAtTime(0.00001, audioCtx.currentTime + duration);
+            osc.stop(audioCtx.currentTime + duration);
+        }
+
+        function speak(text) {
+            synth.cancel();
+            const uttr = new SpeechSynthesisUtterance(text);
+            uttr.lang = 'ja-JP';
+            uttr.rate = 2.3;
+            synth.speak(uttr);
+        }
+
+        function startGame() {
+            gameActive = true;
+            isProcessingSuccess = false;
+            isWaitingForReturn = false;
+            waitingForStartDown = false;
+            score = 0;
+            timeLeft = 60;
+            document.getElementById('val-score').innerText = score;
+            document.getElementById('start-screen').style.display = 'none';
+            document.getElementById('result-screen').style.display = 'none';
+            playSound(880, 0.5);
+            nextCommand();
+
+            timerInterval = setInterval(() => {
+                timeLeft--;
+                document.getElementById('val-timer').innerText = timeLeft;
+                if (timeLeft <= 0) endGame(false);
+            }, 1000);
+        }
+
+        function nextCommand() {
+            currentTarget = commands[Math.floor(Math.random() * commands.length)];
+            cmdText.innerText = currentTarget;
+            cmdText.style.color = "#00ff00";
+            let v = currentTarget.replace("両", "りょう").replace("右", "みぎ").replace("左", "ひだり")
+                                .replace("外", "そと").replace("内", "うち").replace("上", "うえ")
+                                .replace("前", "まえ").replace("後", "うしろ");
+            speak(v);
+        }
+
+        function endGame(isAborted = false) {
+            gameActive = false;
+            clearInterval(timerInterval);
+            document.getElementById('result-screen').style.display = 'flex';
+            document.getElementById('final-score').innerText = score;
+            cmdText.innerText = "";
+            if (isAborted) {
+                speak("中断しました");
+                startLockedAfterAbort = true; 
+            } else {
+                speak("終了です");
+            }
+        }
+
+        function onResults(results) {
+            canvasElement.width = results.image.width;
+            canvasElement.height = results.image.height;
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+            if (results.poseLandmarks) {
+                const lm = results.poseLandmarks;
+                drawConnectors(canvasCtx, lm, POSE_CONNECTIONS, {color: '#ffffff33', lineWidth: 2});
+
+                const nose = lm[0];
+                const lWrist = lm[15], rWrist = lm[16];
+                const lShoulder = lm[11], rShoulder = lm[12];
+                
+
+                const anyHandUp = (lWrist.y < nose.y) || (rWrist.y < nose.y);
+
+                // --- スタート・中断制御 ---
+                if (gameActive) {
+                    if (anyHandUp) {
+                        if (handsUpStartTime === null) handsUpStartTime = Date.now();
+                        if (Date.now() - handsUpStartTime >= EXIT_HOLD_TIME) {
+                            endGame(true);
+                            handsUpStartTime = null;
+                        }
+                    } else { handsUpStartTime = null; }
+                } else {
+                    if (anyHandUp) {
+                        if (!startLockedAfterAbort) waitingForStartDown = true;
+                    } else {
+                        if (waitingForStartDown && !startLockedAfterAbort) {
+                            startGame();
+                        }
+                        startLockedAfterAbort = false; // 手を下ろしたのでロック解除
+                        waitingForStartDown = false;
+                    }
+                }
+
+                // --- 判定ロジック ---
+                if (gameActive) {
+                    if (isWaitingForReturn) {
+                        // 【改善】戻り判定：肩より下、かつ左右が肩の幅の内側付近にあること
+                        const THR_BACK2 = 0.05;
+                        const isLNeutral = lWrist.y > lShoulder.y + 0.1 && Math.abs(lWrist.x - lShoulder.x) < 0.1 && rWrist.z < rShoulder.z + THR_BACK2 && lWrist.z < lShoulder.z + THR_BACK2;
+                        const isRNeutral = rWrist.y > rShoulder.y + 0.1 && Math.abs(rWrist.x - rShoulder.x) < 0.1 && rWrist.z < rShoulder.z + THR_BACK2 && lWrist.z < lShoulder.z + THR_BACK2;
+                        
+                        if (isLNeutral && isRNeutral) {
+                            isWaitingForReturn = false;
+                            nextCommand();
+                        }
+                    } else if (!isProcessingSuccess) {
+                        let success = false;
+                        const THR_UP = 0.15, THR_SIDE = 0.1, THR_FRONT = 0.5, THR_BACK = 0.05;
+
+                        switch (currentTarget) {
+                            case "右上": if (rWrist.y < rShoulder.y - THR_UP && lWrist.y > lShoulder.y) success = true; break;
+                            case "左上": if (lWrist.y < lShoulder.y - THR_UP && rWrist.y > rShoulder.y) success = true; break;
+                            case "両上": if (rWrist.y < rShoulder.y - THR_UP && lWrist.y < lShoulder.y - THR_UP) success = true; break;
+                            
+                            case "右外": if (rWrist.x < rShoulder.x - THR_SIDE && lWrist.x < lShoulder.x + THR_SIDE) success = true; break;
+                            case "左外": if (lWrist.x > lShoulder.x + THR_SIDE && rWrist.x > rShoulder.x - THR_SIDE) success = true; break;
+                            case "両外": if (rWrist.x < rShoulder.x - THR_SIDE && lWrist.x > lShoulder.x + THR_SIDE) success = true; break;
+                            
+                            case "右前": if (rWrist.z < rShoulder.z - THR_FRONT && lWrist.z > lShoulder.z - THR_FRONT/2) success = true; break;
+                            case "左前": if (lWrist.z < lShoulder.z - THR_FRONT && rWrist.z > rShoulder.z - THR_FRONT/2) success = true; break;
+                            case "両前": if (rWrist.z < rShoulder.z - THR_FRONT && lWrist.z < lShoulder.z - THR_FRONT) success = true; break;
+                            
+                            case "右内": if (rWrist.x > rShoulder.x + THR_SIDE && lWrist.x > lShoulder.x - THR_SIDE) success = true; break;
+                            case "左内": if (lWrist.x < lShoulder.x - THR_SIDE && rWrist.x < rShoulder.x + THR_SIDE) success = true; break;
+                            case "両内": if (rWrist.x > rShoulder.x + 0.05 && lWrist.x < lShoulder.x - 0.05) success = true; break;
+
+                            case "右後": if (rWrist.z > rShoulder.z + THR_BACK && lWrist.z < lShoulder.z + THR_BACK)success = true; break;
+                            case "左後": if (rWrist.z < rShoulder.z + THR_BACK && lWrist.z > lShoulder.z + THR_BACK) success = true; break;
+                            case "両後": if (rWrist.z > rShoulder.z + THR_BACK && lWrist.z > lShoulder.z + THR_BACK) success = true; break;
+                        }
+
+                        if (success) {
+                            isProcessingSuccess = true;
+                            score++;
+                            document.getElementById('val-score').innerText = score;
+                            playSound(1200, 0.2);
+                            cmdText.innerText = "OK";
+                            cmdText.style.color = "#ff3366";
+
+                            setTimeout(() => {
+                                isProcessingSuccess = false;
+                                isWaitingForReturn = true;
+                                cmdText.innerText = "戻して";
+                                cmdText.style.color = "#ffff00";
+                            }, 500);
+                        }
+                    }
+                }
+            }
+            canvasCtx.restore();
+        }
+
+        const pose = new Pose({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}` });
+        pose.setOptions({ modelComplexity: 1, minDetectionConfidence: 0.7, minTrackingConfidence: 0.7 });
+        pose.onResults(onResults);
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => { await pose.send({image: videoElement}); },
+            width: 1280, height: 720
+        });
+
+        function initApp() {
+            if (appInitialized) return;
+            audioCtx.resume();
+            appInitialized = true;
+            document.querySelector('.btn-start').style.display = 'none';
+            document.getElementById('start-screen').classList.add('preview-mode');
+            camera.start();
+        }
+    </script>
+</body>
+</html>
